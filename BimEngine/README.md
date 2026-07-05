@@ -14,14 +14,28 @@ client ──POST──▶ API (RAG validate + enrich) ──▶ GeometryCommand
 
 The whole flow runs in **one process** with a single `dotnet run` — no broker, no Revit, no extra setup.
 
+For the real Revit path the consumer moves to its own process (Revit); the API hands off via a shared
+drop folder instead of the in-process channel — same `IMessageQueue` contract:
+
+```
+client ─POST─▶ API (RAG validate + enrich + LAYOUT) ─▶ GeometryCommand JSON
+                                                        │ FileDropMessageQueue.Publish (writes a file)
+                                                        ▼
+                                              shared drop folder
+                                                        │ FileSystemWatcher   (Revit process)
+                                                        ▼
+                        BimEngine.RevitAddin ─▶ ExternalEvent ─▶ builds Levels/Walls/Rooms/Doors
+```
+
 ## Projects
 
 | Project | What it is |
 |---|---|
-| `BimEngine.Core` | Models (`BuildingRequest`, `RoomSpec`, `GeometryCommand`) + contracts (`IMessageQueue`, `IGeometryConsumer`). No dependencies. |
-| `BimEngine.Infrastructure` | `InMemoryMessageQueue` — pub/sub over `System.Threading.Channels.Channel<T>`. Registered as a **singleton** so producer and consumer share one channel. |
-| `BimEngine.Api` | ASP.NET Core Web API. `POST /projects`, `RagService` (norm validation + room distribution), Swagger. Also hosts the consumer as a `BackgroundService` for the PoC. |
-| `BimEngine.MockConsumer` | `MockRevitConsumer` — subscribes to the queue and logs each room. Stands in for the real Revit add-in. |
+| `BimEngine.Core` | Models (`BuildingRequest`, `RoomSpec` + `RoomFootprint`, `GeometryCommand` + `DoorSpec`) + contracts (`IMessageQueue`, `IGeometryConsumer`). No dependencies. |
+| `BimEngine.Infrastructure` | `InMemoryMessageQueue` (in-process `Channel<T>`) **and** `FileDropMessageQueue` (cross-process shared folder). Both implement the same `IMessageQueue`. |
+| `BimEngine.Api` | ASP.NET Core Web API. `POST /projects`, `RagService` (norm validation + room **layout** + door derivation), Swagger. Hosts the mock consumer in `InMemory` mode. |
+| `BimEngine.MockConsumer` | `MockRevitConsumer` — subscribes to the queue and logs each room. The zero-setup, no-Revit demo consumer. |
+| `BimEngine.RevitAddin` | **Real Revit add-in** (Windows + Revit 2025/2026 only). Consumes `GeometryCommand`s from the drop folder and builds Levels/Walls/Rooms/Doors. Not part of `BimEngine.sln` — see [Revit add-in](#revit-add-in-windows--revit-20252026). |
 
 ## Requirements
 
@@ -48,17 +62,23 @@ curl -X POST http://localhost:5080/projects \
   -d '{"floorCount":2,"bedrooms":3,"bathrooms":2,"plotAreaSqm":120,"buildingType":"house"}'
 ```
 
-Returns **202 Accepted** with the generated `GeometryCommand` JSON so you can see what was produced:
+Returns **202 Accepted** with the generated `GeometryCommand` JSON so you can see what was produced.
+Each room now carries a concrete `footprint` (metres, floor-local) and the command carries the
+derived `doors` — everything the Revit add-in needs to draw the schema:
 
 ```json
 {
-  "projectId": "PRJ-20260705-105222-1cc427",
+  "projectId": "PRJ-20260705-113236-3703a9",
   "floorCount": 2,
+  "floorHeightM": 3,
   "rooms": [
-    { "name": "Hallway (Floor 0)", "areaSqm": 4, "floorIndex": 0, "adjacentTo": [] },
-    { "name": "Living Room", "areaSqm": 14, "floorIndex": 0, "adjacentTo": ["Hallway (Floor 0)"] },
-    { "name": "Bedroom 1", "areaSqm": 9, "floorIndex": 0, "adjacentTo": ["Hallway (Floor 0)"] }
-    // ...
+    { "name": "Living Room", "areaSqm": 14, "floorIndex": 0, "adjacentTo": ["Hallway (Floor 0)"],
+      "footprint": { "originXm": 0, "originYm": 2, "widthM": 3.5, "depthM": 4 } }
+    // ... bedrooms, bathrooms, one full-width hallway per floor
+  ],
+  "doors": [
+    { "fromRoom": "Living Room", "toRoom": "Hallway (Floor 0)", "centerXm": 1.75, "centerYm": 2, "floorIndex": 0 }
+    // ... one per shared wall
   ]
 }
 ```
@@ -95,6 +115,47 @@ After a valid POST the consumer prints one line per room:
 
 That proves the full path: client → API/RAG → queue → consumer.
 
+## Transport modes
+
+Selected by config (`appsettings.json` or env var `Transport`) — the `IMessageQueue` swap is DI-only,
+callers never change:
+
+| `Transport` | Queue | Consumer | Setup |
+|---|---|---|---|
+| `InMemory` (default) | `InMemoryMessageQueue` (`Channel<T>`) | `MockRevitConsumer` in-process | none — one `dotnet run` |
+| `FileDrop` | `FileDropMessageQueue` (shared folder) | the Revit add-in, separate process | shared folder (defaults to `%TEMP%/BimEngine/drop`) |
+
+```bash
+# FileDrop mode (API only publishes; Revit consumes)
+Transport=FileDrop DropFolder=/path/to/drop dotnet run --project BimEngine.Api
+```
+
+## Revit add-in (Windows + Revit 2025/2026)
+
+`BimEngine.RevitAddin` is the **real** consumer. It is deliberately **not** in `BimEngine.sln`
+(so `dotnet build` stays green on Linux/CI); build it explicitly on a Windows box that has Revit:
+
+```powershell
+# from the BimEngine folder, on Windows with Revit 2025 installed
+dotnet build BimEngine.RevitAddin/BimEngine.RevitAddin.csproj -p:RevitVersion=2025
+```
+
+The build's `DeployAddin` target copies the DLLs + `BimEngine.RevitAddin.addin` into
+`%AppData%\Autodesk\Revit\Addins\2025\`. Then:
+
+1. Start the API in FileDrop mode. Point it at a folder the add-in also watches — either set
+   `DropFolder` on the API and the `BIMENGINE_DROP` env var for Revit to the same path, or leave
+   both unset to use the shared default `%TEMP%/BimEngine/drop`.
+2. Launch Revit and open/create a project from the **Architectural** template (guarantees a door
+   family + a phase). A **BimEngine** ribbon panel appears; its button shows the watched folder.
+3. `POST /projects`. The add-in picks up the command file and builds **Levels, Walls, Rooms, and
+   Doors** in the active document, matching the JSON.
+
+How it satisfies Revit's threading rule: a background loop reads the drop folder and only
+*enqueues* each command + calls `ExternalEvent.Raise()`; Revit then runs `GeometryEventHandler`
+on its **main API thread**, inside a `Transaction`, where `RevitGeometryBuilder` calls the Revit
+API. The API is single-threaded, so geometry can never be built on the consumer thread directly.
+
 ## Where the real integrations plug in (the seams)
 
 The PoC is built around two interfaces so real implementations drop in without touching callers:
@@ -106,16 +167,16 @@ PDFs/Excel (embed the request → retrieve relevant clauses from a vector store 
 LLM extract the concrete numbers). The method still returns a `GeometryCommand`; the
 controller never changes.
 
-### 2. `IGeometryConsumer` → real Revit add-in
-`MockRevitConsumer` implements `IGeometryConsumer` and just logs. A production consumer
-runs **inside Revit's process** (loaded via a `.addin` manifest), exposes an
-`IExternalCommand` entry point, and marshals each `GeometryCommand` onto Revit's main
-thread via `IExternalEventHandler` + `ExternalEvent.Raise()` before calling the Revit API
-(`Document.Create.*`). The Revit API is single-threaded, so it **cannot** run on the queue
-consumer thread directly. Only the body of `ProcessAsync` changes.
+### 2. `IGeometryConsumer` → real Revit add-in ✅ implemented
+`MockRevitConsumer` (logs) and `BimEngine.RevitAddin.RevitGeometryConsumer` (drives Revit) both
+implement the same `IGeometryConsumer`. The Revit one runs **inside Revit's process** (loaded via
+`BimEngine.RevitAddin.addin`) and marshals each `GeometryCommand` onto Revit's main thread via
+`IExternalEventHandler` + `ExternalEvent.Raise()` before calling the Revit API. See
+[Revit add-in](#revit-add-in-windows--revit-20252026). To grow it, extend `RevitGeometryBuilder`
+(e.g. windows, floors/roofs, real families).
 
-### 3. `IMessageQueue` → real broker
-`InMemoryMessageQueue` can be swapped for a `RabbitMqMessageQueue` (or Azure Service Bus /
-Kafka) implementing the same interface. Only the DI registration in `Program.cs` changes —
-once Revit is a separate process, the in-memory channel is replaced by a network broker and
-producer/consumer no longer need to share a process.
+### 3. `IMessageQueue` → cross-process transport ✅ file-drop implemented
+`InMemoryMessageQueue` (one process) and `FileDropMessageQueue` (shared folder, two processes) both
+implement `IMessageQueue`; the choice is DI-only (`Transport` config). A future
+`RabbitMqMessageQueue` (or Azure Service Bus / Kafka) drops in the same way for networked/scalable
+delivery, with no change to the API, `RagService`, or the add-in.

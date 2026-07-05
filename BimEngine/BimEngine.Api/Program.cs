@@ -6,17 +6,35 @@ using BimEngine.MockConsumer;
 var builder = WebApplication.CreateBuilder(args);
 
 // --- Composition root --------------------------------------------------------------------------
-// The queue is a SINGLETON so the API (producer) and the background consumer share one channel.
-builder.Services.AddSingleton<IMessageQueue, InMemoryMessageQueue>();
-
 // RAG-style validation/enrichment. Stateless -> singleton is fine.
 builder.Services.AddSingleton<IRagService, RagService>();
 
-// Mock Revit consumer: hosted in THIS process as a BackgroundService for the PoC. It resolves the
-// same IMessageQueue singleton registered above. Swap this line for a real out-of-process Revit
-// add-in later without touching the API. (Registered so the same instance backs the hosted service.)
-builder.Services.AddSingleton<MockRevitConsumer>();
-builder.Services.AddHostedService(sp => sp.GetRequiredService<MockRevitConsumer>());
+// Transport is switchable (DI-only — the IMessageQueue seam never leaks to callers):
+//   "InMemory" (default): single-process demo. Channel<T> queue + in-process MockRevitConsumer.
+//                         Zero setup — one `dotnet run` runs the whole pipeline.
+//   "FileDrop":           cross-process. API writes command files to a shared folder that a real
+//                         Revit add-in (separate process) watches. No mock consumer here.
+var transport = builder.Configuration["Transport"] ?? "InMemory";
+
+if (string.Equals(transport, "FileDrop", StringComparison.OrdinalIgnoreCase))
+{
+    var configuredDrop = builder.Configuration["DropFolder"];
+    var dropDir = string.IsNullOrWhiteSpace(configuredDrop)
+        ? Path.Combine(Path.GetTempPath(), "BimEngine", "drop")
+        : configuredDrop;
+    // Singleton so the whole app shares one instance over the shared folder.
+    builder.Services.AddSingleton<IMessageQueue>(_ => new FileDropMessageQueue(dropDir));
+}
+else
+{
+    // The queue is a SINGLETON so the API (producer) and the consumer share one channel.
+    builder.Services.AddSingleton<IMessageQueue, InMemoryMessageQueue>();
+
+    // Mock Revit consumer, hosted in THIS process as a BackgroundService. Resolves the same
+    // IMessageQueue singleton. The real Revit add-in replaces this out-of-process (FileDrop).
+    builder.Services.AddSingleton<MockRevitConsumer>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<MockRevitConsumer>());
+}
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();

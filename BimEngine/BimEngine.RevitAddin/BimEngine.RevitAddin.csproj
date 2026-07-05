@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Autodesk Revit add-in. Windows + Revit ONLY.
+
+    * Revit 2025 and 2026 run on .NET 8, so this targets net8.0-windows, x64.
+    * Deliberately NOT part of BimEngine.sln so `dotnet build` on Linux/CI stays green.
+      Build it explicitly on a Windows box that has Revit installed:
+          dotnet build BimEngine.RevitAddin/BimEngine.RevitAddin.csproj -p:RevitVersion=2025
+    * RevitAPI.dll / RevitAPIUI.dll are referenced from the local Revit install and NOT copied
+      (Private=false) — Revit loads its own copies at runtime.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+
+    <!-- Override on the command line for a different Revit: -p:RevitVersion=2026 -->
+    <RevitVersion Condition="'$(RevitVersion)' == ''">2025</RevitVersion>
+    <RevitDir Condition="'$(RevitDir)' == ''">C:\Program Files\Autodesk\Revit $(RevitVersion)</RevitDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="RevitAPI">
+      <HintPath>$(RevitDir)\RevitAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="RevitAPIUI">
+      <HintPath>$(RevitDir)\RevitAPIUI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BimEngine.Core\BimEngine.Core.csproj" />
+    <ProjectReference Include="..\BimEngine.Infrastructure\BimEngine.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <!-- Copy the add-in + its own (non-Revit) dependencies into the Revit Addins folder. -->
+  <Target Name="DeployAddin" AfterTargets="Build" Condition="'$(OS)' == 'Windows_NT'">
+    <PropertyGroup>
+      <AddinsDir>$(AppData)\Autodesk\Revit\Addins\$(RevitVersion)</AddinsDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(AddinsDir)" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\BimEngine.RevitAddin.addin" DestinationFolder="$(AddinsDir)" />
+    <Copy SourceFiles="$(TargetDir)BimEngine.RevitAddin.dll;$(TargetDir)BimEngine.Core.dll;$(TargetDir)BimEngine.Infrastructure.dll"
+          DestinationFolder="$(AddinsDir)" />
+  </Target>
+
+</Project>

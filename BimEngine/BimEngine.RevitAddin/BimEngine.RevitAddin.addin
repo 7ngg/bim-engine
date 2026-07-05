@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>BimEngine</Name>
+    <Assembly>BimEngine.RevitAddin.dll</Assembly>
+    <FullClassName>BimEngine.RevitAddin.App</FullClassName>
+    <AddInId>5ed248d4-7ab2-40d8-91bc-7b0e949e6206</AddInId>
+    <VendorId>BIMENG</VendorId>
+    <VendorDescription>BimEngine PoC — file-drop geometry consumer</VendorDescription>
+  </AddIn>
+</RevitAddIns>
