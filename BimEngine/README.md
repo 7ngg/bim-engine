@@ -140,6 +140,17 @@ Transport=FileDrop DropFolder=/path/to/drop dotnet run --project BimEngine.Api
 dotnet build BimEngine.RevitAddin/BimEngine.RevitAddin.csproj -p:RevitVersion=2025
 ```
 
+**One-shot launcher:** `run-windows.ps1` does the whole thing — sets the shared drop folder,
+builds + deploys the add-in, starts Revit, then runs the API in FileDrop mode:
+
+```powershell
+.\run-windows.ps1                                 # Revit 2025, drop C:\BimEngineDrop
+.\run-windows.ps1 -RevitVersion 2026 -DropFolder D:\drop
+.\run-windows.ps1 -SkipAddinBuild -SkipRevit      # API only
+```
+
+Manual steps below if you'd rather run each process yourself.
+
 The build's `DeployAddin` target copies the DLLs + `BimEngine.RevitAddin.addin` into
 `%AppData%\Autodesk\Revit\Addins\2025\`. Then:
 
