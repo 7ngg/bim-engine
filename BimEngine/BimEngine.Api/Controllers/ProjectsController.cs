@@ -59,7 +59,25 @@ public sealed class ProjectsController : ControllerBase
     [ProducesResponseType(typeof(IReadOnlyList<GeometryCommand>), StatusCodes.Status202Accepted)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
-    public async Task<IActionResult> Prompt(UserPrompt prompt, CancellationToken ct)
+    public Task<IActionResult> Prompt(UserPrompt prompt, CancellationToken ct) =>
+        GenerateAndPublish(prompt, _plan.GenerateVariantsAsync, ct);
+
+    /// <summary>
+    /// Same contract as <see cref="Prompt"/> but one-stage: Gemini generates the layout variants
+    /// directly from the brief (no separate extraction call). Faster/cheaper; commands carry no brief.
+    /// </summary>
+    [HttpPost("prompt/direct")]
+    [ProducesResponseType(typeof(IReadOnlyList<GeometryCommand>), StatusCodes.Status202Accepted)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    public Task<IActionResult> PromptDirect(UserPrompt prompt, CancellationToken ct) =>
+        GenerateAndPublish(prompt, _plan.GenerateVariantsDirectAsync, ct);
+
+    // Shared flow: validate → generate variants via the given strategy → publish each → 202.
+    private async Task<IActionResult> GenerateAndPublish(
+        UserPrompt prompt,
+        Func<string, CancellationToken, Task<IReadOnlyList<GeometryCommand>>> generate,
+        CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(prompt.Text))
             return Problem(detail: "Prompt text is required.", statusCode: StatusCodes.Status400BadRequest);
@@ -67,7 +85,7 @@ public sealed class ProjectsController : ControllerBase
         IReadOnlyList<GeometryCommand> commands;
         try
         {
-            commands = await _plan.GenerateVariantsAsync(prompt.Text, ct);
+            commands = await generate(prompt.Text, ct);
         }
         catch (FloorPlanConfigException ex)
         {

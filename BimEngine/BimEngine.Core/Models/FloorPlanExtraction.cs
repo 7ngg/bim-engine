@@ -23,7 +23,7 @@ public record ProjectInfo
 public record RoomSpecs
 {
     public required string Id { get; init; }
-    public required string Type { get; init; }
+    public required RoomType Type { get; init; }
     public int Count { get; init; } = 1;
     public bool IsPrimary { get; init; }
     public double? MinAreaSqm { get; init; }

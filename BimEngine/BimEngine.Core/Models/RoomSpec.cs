@@ -16,7 +16,7 @@ public record RoomSpec(
     // --- enrichment (defaulted, additive) ------------------------------------------------------
     // Concrete per-room semantics carried from the extracted brief so the Revit renderer can act on
     // them (room department/name, exterior placement + window, ensuite grouping, sizing target).
-    string? Type = null,               // "bedroom" | "kitchen" | "living" | ...
+    RoomType? Type = null,             // constrained room kind (see RoomType)
     string? PrivacyLevel = null,       // "private" | "public" | "shared"
     bool RequiresNaturalLight = false, // → place on an exterior wall, add a window
     bool RequiresEnsuite = false,

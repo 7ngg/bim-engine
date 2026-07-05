@@ -9,10 +9,21 @@ namespace BimEngine.Api.Services;
 /// </summary>
 public interface IFloorPlanPromptService
 {
-    /// <summary>Extract params from <paramref name="prompt"/> and generate layout variants.</summary>
+    /// <summary>
+    /// Two-stage: extract structured params from <paramref name="prompt"/>, then generate layout
+    /// variants from those params. Each command carries the extracted brief.
+    /// </summary>
     /// <exception cref="FloorPlanConfigException">Thrown when GEMINI_API_KEY is not configured.</exception>
     /// <exception cref="FloorPlanUpstreamException">Thrown when Gemini errors or returns unusable output.</exception>
     Task<IReadOnlyList<GeometryCommand>> GenerateVariantsAsync(string prompt, CancellationToken ct);
+
+    /// <summary>
+    /// One-stage: let Gemini generate layout variants directly from <paramref name="prompt"/> in a
+    /// single call (no separate extraction step). Faster/cheaper; commands carry no brief.
+    /// </summary>
+    /// <exception cref="FloorPlanConfigException">Thrown when GEMINI_API_KEY is not configured.</exception>
+    /// <exception cref="FloorPlanUpstreamException">Thrown when Gemini errors or returns unusable output.</exception>
+    Task<IReadOnlyList<GeometryCommand>> GenerateVariantsDirectAsync(string prompt, CancellationToken ct);
 }
 
 /// <summary>Missing/invalid service configuration. Maps to HTTP 500.</summary>
