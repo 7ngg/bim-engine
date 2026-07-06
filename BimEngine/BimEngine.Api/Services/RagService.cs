@@ -3,27 +3,42 @@ using BimEngine.Core.Models;
 namespace BimEngine.Api.Services;
 
 /// <summary>
-/// PoC RAG service. Applies a handful of hardcoded "building norm" rules, then distributes the
-/// requested rooms across floors with simple placeholder adjacency (everything hangs off a
-/// per-floor hallway, mirroring a bubble-diagram hub).
+/// PoC RAG service. Validates a user-authored <see cref="FloorPlanBrief"/> against a handful of
+/// hardcoded "building norms", expands its room program (Count → instances) across floors, then
+/// lays each floor out with a simple placeholder scheme: a full-width hallway spine with every
+/// other room in a row above it, so each room shares an edge with the hallway (→ a door). The rich
+/// brief is carried through onto the command so a real Revit renderer keeps every design intent.
 /// </summary>
 public sealed class RagService : IRagService
 {
     // --- Hardcoded "norms" -------------------------------------------------------------------
     // TODO(RAG): Replace these constants with retrieval over indexed building-code documents.
-    //   1. Ingest norm PDFs/Excel (e.g. residential code tables) into a vector store.
-    //   2. Embed the incoming BuildingRequest and retrieve the relevant clauses.
+    //   1. Ingest norm PDFs/Excel (e.g. residential + commercial code tables) into a vector store.
+    //   2. Embed the incoming FloorPlanBrief and retrieve the relevant clauses.
     //   3. Have an LLM extract the concrete numbers (min areas, ratios, floor heights) below.
-    // The rest of this class (validation + distribution) stays identical once the numbers
-    // come from retrieval instead of these literals.
-    private const double MinBedroomAreaSqm = 9.0;      // min habitable bedroom area
-    private const double MinBathroomAreaSqm = 4.0;     // min bathroom area
-    private const double MinKitchenAreaSqm = 8.0;
-    private const double MinLivingAreaSqm = 14.0;
-    private const double MinHallwayAreaSqm = 4.0;
-    private const int MaxBedroomsPerBathroom = 3;      // bathroom-to-bedroom ratio floor
-    private const double FloorHeightM = 3.0;           // reasonable residential floor height
-    private const double MinPlotAreaPerFloorSqm = 25.0; // sanity: footprint must fit the program
+    // The rest of this class (validation + layout) stays identical once the numbers come from
+    // retrieval instead of these literals.
+    private const double DefaultFloorHeightM = 3.0;
+    private const int MaxCountPerProgram = 500;         // sanity ceiling on Count expansion
+
+    // Per-type minimum habitable area (sqm). Also the fallback size when a program gives no area.
+    private static readonly IReadOnlyDictionary<RoomType, double> MinAreaByType = new Dictionary<RoomType, double>
+    {
+        [RoomType.LivingRoom] = 14.0,
+        [RoomType.Kitchen] = 8.0,
+        [RoomType.DiningRoom] = 8.0,
+        [RoomType.Bedroom] = 9.0,
+        [RoomType.Bathroom] = 4.0,
+        [RoomType.Hallway] = 4.0,
+        [RoomType.Office] = 6.0,
+        [RoomType.Laundry] = 3.0,
+        [RoomType.Storage] = 2.0,
+        [RoomType.Garage] = 12.0,
+        [RoomType.Entrance] = 3.0,
+        [RoomType.Balcony] = 3.0,
+        [RoomType.Staircase] = 4.0,
+        [RoomType.Other] = 6.0,
+    };
 
     // --- Layout parameters -------------------------------------------------------------------
     // Simple corridor scheme: a full-width hallway spine at the bottom of each floor, with every
@@ -31,105 +46,172 @@ public sealed class RagService : IRagService
     private const double RoomDepthM = 4.0;     // depth of the room row (north-south)
     private const double HallwayDepthM = 2.0;  // depth of the hallway spine
 
-    public GeometryCommand Enrich(BuildingRequest request)
+    public GeometryCommand Enrich(FloorPlanBrief brief)
     {
-        Validate(request);
+        var floorCount = ResolveFloorCount(brief);
+        Validate(brief, floorCount);
 
         var projectId = $"PRJ-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..6]}";
-        var rooms = DistributeRooms(request);
+        var rooms = LayOut(brief, floorCount);
         var doors = DeriveDoors(rooms);
 
-        return new GeometryCommand(projectId, request.FloorCount, rooms, FloorHeightM, doors);
+        return new GeometryCommand(projectId, floorCount, rooms, DefaultFloorHeightM, doors, Brief: brief);
     }
+
+    // Floors span the greatest of: the declared NumFloors, any explicit per-room FloorIndex, and 1.
+    private static int ResolveFloorCount(FloorPlanBrief brief)
+    {
+        var declared = brief.Project?.NumFloors ?? 1;
+        var maxExplicit = brief.Rooms
+            .Where(r => r.FloorIndex is >= 0)
+            .Select(r => r.FloorIndex!.Value + 1)
+            .DefaultIfEmpty(1)
+            .Max();
+        return Math.Max(Math.Max(declared, maxExplicit), 1);
+    }
+
+    // Resolved size of a program's rooms: explicit target, else min, else the per-type default.
+    private static double ResolveArea(RoomProgram p) =>
+        p.TargetAreaSqm ?? p.MinAreaSqm ?? MinAreaByType[p.Type];
 
     // --- Norm validation ---------------------------------------------------------------------
-    private static void Validate(BuildingRequest r)
+    private static void Validate(FloorPlanBrief brief, int floorCount)
     {
-        if (r.FloorCount < 1)
-            throw new RagValidationException("FloorCount must be at least 1.");
-        if (r.Bedrooms < 1)
-            throw new RagValidationException("A dwelling needs at least 1 bedroom.");
-        if (r.Bathrooms < 1)
-            throw new RagValidationException("A dwelling needs at least 1 bathroom.");
-        if (r.PlotAreaSqm <= 0)
-            throw new RagValidationException("PlotAreaSqm must be positive.");
-        if (string.IsNullOrWhiteSpace(r.BuildingType))
-            throw new RagValidationException("BuildingType is required.");
+        if (brief.Rooms.Count == 0)
+            throw new RagValidationException("The brief must contain at least one room in its program.");
 
-        // Bathroom-to-bedroom ratio: at least 1 bathroom per MaxBedroomsPerBathroom bedrooms.
-        var requiredBathrooms = (int)Math.Ceiling(r.Bedrooms / (double)MaxBedroomsPerBathroom);
-        if (r.Bathrooms < requiredBathrooms)
-            throw new RagValidationException(
-                $"{r.Bedrooms} bedrooms require at least {requiredBathrooms} bathroom(s) " +
-                $"(1 per {MaxBedroomsPerBathroom} bedrooms); got {r.Bathrooms}.");
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in brief.Rooms)
+        {
+            if (string.IsNullOrWhiteSpace(p.Id))
+                throw new RagValidationException("Every room program entry needs a non-empty Id.");
+            if (!seenIds.Add(p.Id))
+                throw new RagValidationException($"Duplicate room Id '{p.Id}' in the program.");
+            if (p.Count is < 1 or > MaxCountPerProgram)
+                throw new RagValidationException($"Room '{p.Id}' Count must be between 1 and {MaxCountPerProgram}.");
+            if (p.FloorIndex is { } fi && (fi < 0 || fi >= floorCount))
+                throw new RagValidationException(
+                    $"Room '{p.Id}' FloorIndex {fi} is outside the building's {floorCount} floor(s).");
 
-        // Footprint sanity: rough program area must plausibly fit within plot * floors.
-        var minProgramArea = MinLivingAreaSqm + MinKitchenAreaSqm
-            + (r.Bedrooms * MinBedroomAreaSqm)
-            + (r.Bathrooms * MinBathroomAreaSqm);
-        var availableArea = r.PlotAreaSqm * r.FloorCount;
-        if (availableArea < minProgramArea)
-            throw new RagValidationException(
-                $"Plot too small: need ~{minProgramArea:0.#} sqm of floor area for the program " +
-                $"but only {availableArea:0.#} sqm available across {r.FloorCount} floor(s).");
+            var minArea = MinAreaByType[p.Type];
+            var area = ResolveArea(p);
+            if (area < minArea)
+                throw new RagValidationException(
+                    $"Room '{p.Id}' area {area:0.#} sqm is below the {minArea:0.#} sqm minimum for a {p.Type}.");
+            if (p.MaxAreaSqm is { } max && area > max)
+                throw new RagValidationException(
+                    $"Room '{p.Id}' area {area:0.#} sqm exceeds its own MaxAreaSqm {max:0.#}.");
+        }
 
-        if (r.PlotAreaSqm < MinPlotAreaPerFloorSqm)
-            throw new RagValidationException(
-                $"PlotAreaSqm {r.PlotAreaSqm:0.#} is below the {MinPlotAreaPerFloorSqm} sqm minimum footprint.");
+        // Footprint sanity: the whole program must plausibly fit within plot * floors, when a plot
+        // is given. (Without a plot we cannot bound it — a real renderer would size the plot instead.)
+        var plot = brief.Constraints?.PlotDimensions;
+        if (plot?.WidthM is > 0 && plot.DepthM is > 0)
+        {
+            var available = plot.WidthM.Value * plot.DepthM.Value * floorCount;
+            var required = brief.Rooms.Sum(p => ResolveArea(p) * p.Count);
+            if (available < required)
+                throw new RagValidationException(
+                    $"Plot too small: program needs ~{required:0.#} sqm of floor area but only " +
+                    $"{available:0.#} sqm is available across {floorCount} floor(s).");
+        }
     }
 
-    // --- Room distribution -------------------------------------------------------------------
-    // Simple + readable on purpose: one hallway per floor acts as the adjacency hub. Bedrooms and
-    // bathrooms spread round-robin across floors; common rooms (living, kitchen) go on floor 0.
-    // Every non-hallway room sits in a single row above the full-width hallway, so it shares an
-    // edge with the hallway and (where placed side by side) with its row neighbours.
-    private static List<RoomSpec> DistributeRooms(BuildingRequest r)
+    // --- Program expansion + layout ----------------------------------------------------------
+    // Expand each program into Count instances, assign every instance to a floor (explicit, else
+    // round-robin), then lay each floor out as a room row above a full-width hallway hub.
+    private static List<RoomSpec> LayOut(FloorPlanBrief brief, int floorCount)
     {
         static string HallwayOn(int floor) => $"Hallway (Floor {floor})";
+        var wantHallway = brief.Circulation?.RequiresHallway ?? true;
 
-        // 1. Assign the program to floors WITHOUT geometry yet: (name, area, floor, adjacency).
-        var byFloor = new Dictionary<int, List<(string Name, double Area, List<string> Adj)>>();
-        for (var floor = 0; floor < r.FloorCount; floor++)
-            byFloor[floor] = new List<(string, double, List<string>)>();
+        // 1. Expand the program into placed instances, WITHOUT geometry yet.
+        var byFloor = new Dictionary<int, List<Instance>>();
+        for (var f = 0; f < floorCount; f++) byFloor[f] = [];
 
-        // Common rooms live on the ground floor (living first, then kitchen beside it).
-        byFloor[0].Add(("Living Room", MinLivingAreaSqm, new List<string> { HallwayOn(0) }));
-        byFloor[0].Add(("Kitchen", MinKitchenAreaSqm, new List<string> { HallwayOn(0), "Living Room" }));
+        // Required-adjacency groups + per-room AdjacentTo → a symmetric neighbour map keyed by Id.
+        var neighbours = BuildNeighbourMap(brief);
 
-        // Bedrooms then bathrooms, each round-robin across floors, adjacent to their floor hallway.
-        for (var i = 0; i < r.Bedrooms; i++)
+        var autoCursor = 0; // round-robin floor pointer for rooms with no explicit FloorIndex
+        foreach (var p in brief.Rooms)
         {
-            var floor = i % r.FloorCount;
-            byFloor[floor].Add(($"Bedroom {i + 1}", MinBedroomAreaSqm, new List<string> { HallwayOn(floor) }));
-        }
-        for (var i = 0; i < r.Bathrooms; i++)
-        {
-            var floor = i % r.FloorCount;
-            byFloor[floor].Add(($"Bathroom {i + 1}", MinBathroomAreaSqm, new List<string> { HallwayOn(floor) }));
-        }
-
-        // 2. Lay out each floor and materialise RoomSpecs with concrete footprints.
-        var rooms = new List<RoomSpec>();
-        for (var floor = 0; floor < r.FloorCount; floor++)
-        {
-            var cursorX = 0.0; // running x-offset of the room row
-            foreach (var (name, area, adj) in byFloor[floor])
+            var area = ResolveArea(p);
+            for (var i = 0; i < p.Count; i++)
             {
-                var width = area / RoomDepthM;
+                var name = p.Count == 1 ? p.Id : $"{p.Id} {i + 1}";
+                var floor = p.FloorIndex ?? (autoCursor++ % floorCount);
+                var adj = new List<string>();
+                if (wantHallway) adj.Add(HallwayOn(floor));
+                if (neighbours.TryGetValue(p.Id, out var extra)) adj.AddRange(extra);
+
+                byFloor[floor].Add(new Instance(name, p, area, floor, adj));
+            }
+        }
+
+        // 2. Lay out each floor and materialise enriched RoomSpecs with concrete footprints.
+        var rooms = new List<RoomSpec>();
+        for (var floor = 0; floor < floorCount; floor++)
+        {
+            var onFloor = byFloor[floor];
+            if (onFloor.Count == 0) continue;
+
+            var cursorX = 0.0; // running x-offset of the room row
+            foreach (var inst in onFloor)
+            {
+                var width = inst.Area / RoomDepthM;
                 var footprint = new RoomFootprint(cursorX, HallwayDepthM, width, RoomDepthM);
-                rooms.Add(new RoomSpec(name, area, floor, adj, footprint));
+                var p = inst.Program;
+                rooms.Add(new RoomSpec(
+                    inst.Name, inst.Area, floor, inst.Adjacent, footprint,
+                    Type: p.Type,
+                    PrivacyLevel: p.PrivacyLevel,
+                    RequiresNaturalLight: p.RequiresNaturalLight,
+                    RequiresEnsuite: p.RequiresEnsuite,
+                    IsPrimary: p.IsPrimary,
+                    TargetAreaSqm: p.TargetAreaSqm));
                 cursorX += width;
             }
 
-            // The hallway spans the full row width along the bottom of the floor.
-            var hallWidth = cursorX > 0 ? cursorX : MinHallwayAreaSqm / HallwayDepthM;
-            var hallFootprint = new RoomFootprint(0, 0, hallWidth, HallwayDepthM);
-            rooms.Add(new RoomSpec(HallwayOn(floor), hallWidth * HallwayDepthM, floor,
-                new List<string>(), hallFootprint));
+            if (wantHallway)
+            {
+                var hallFootprint = new RoomFootprint(0, 0, cursorX, HallwayDepthM);
+                rooms.Add(new RoomSpec(HallwayOn(floor), cursorX * HallwayDepthM, floor,
+                    [], hallFootprint, Type: RoomType.Hallway));
+            }
         }
 
         return rooms;
     }
+
+    // Fold RoomProgram.AdjacentTo and AdjacencySpec.Required into one symmetric Id→neighbours map.
+    // Door derivation later only realises a neighbour when the two footprints actually touch, so an
+    // unmatched or multi-instance neighbour is simply harmless intent.
+    private static Dictionary<string, HashSet<string>> BuildNeighbourMap(FloorPlanBrief brief)
+    {
+        var map = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        void Link(string a, string b)
+        {
+            if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)) return;
+            (map.TryGetValue(a, out var set) ? set : map[a] = []).Add(b);
+        }
+
+        foreach (var p in brief.Rooms)
+            foreach (var other in p.AdjacentTo)
+            {
+                Link(p.Id, other);
+                Link(other, p.Id);
+            }
+
+        foreach (var group in brief.Adjacencies?.Required ?? [])
+            foreach (var a in group)
+                foreach (var b in group)
+                    Link(a, b);
+
+        return map;
+    }
+
+    // An expanded, floor-assigned room instance before geometry is computed.
+    private sealed record Instance(string Name, RoomProgram Program, double Area, int Floor, List<string> Adjacent);
 
     // --- Door derivation ---------------------------------------------------------------------
     // A door exists wherever two adjacent rooms on the same floor share a wall edge.

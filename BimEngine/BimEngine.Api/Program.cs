@@ -6,11 +6,9 @@ using BimEngine.MockConsumer;
 var builder = WebApplication.CreateBuilder(args);
 
 // --- Composition root --------------------------------------------------------------------------
-// RAG-style validation/enrichment. Stateless -> singleton is fine.
+// RAG-style validation/enrichment: user-authored FloorPlanBrief -> GeometryCommand. Stateless ->
+// singleton is fine.
 builder.Services.AddSingleton<IRagService, RagService>();
-
-// NL prompt -> Gemini two-stage pipeline -> floor-plan variants. Stateless -> singleton.
-builder.Services.AddSingleton<IFloorPlanPromptService, FloorPlanPromptService>();
 
 // Transport is switchable (DI-only — the IMessageQueue seam never leaks to callers):
 //   "InMemory" (default): single-process demo. Channel<T> queue + in-process MockRevitConsumer.
@@ -39,7 +37,6 @@ else
     builder.Services.AddHostedService(sp => sp.GetRequiredService<MockRevitConsumer>());
 }
 
-builder.Services.AddHttpClient();
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();

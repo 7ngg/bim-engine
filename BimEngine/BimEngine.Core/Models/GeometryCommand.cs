@@ -12,10 +12,9 @@ public record GeometryCommand(
     List<RoomSpec> Rooms,
     double FloorHeightM = 3.0,
     List<DoorSpec>? Doors = null,
-    // Full stage-1 design brief (ProjectInfo, Constraints incl. orientation/plot/style, Adjacencies,
-    // Circulation, RoomSummary, ExtractionMeta). Carried whole so nothing useful to Revit is lost;
-    // null on the classic BuildingRequest path.
-    FloorPlanExtraction? Brief = null);
+    // Full user-authored design brief (ProjectInfo, Constraints incl. orientation/plot/style,
+    // Adjacencies, Circulation, the room program). Carried whole so nothing useful to Revit is lost.
+    FloorPlanBrief? Brief = null);
 
 /// <summary>
 /// A door on the shared wall between two rooms, located at a floor-local point in metres.
