@@ -119,7 +119,9 @@ public sealed class RagService : IRagService
 
     // --- Program expansion + layout ----------------------------------------------------------
     // Expand each program into Count instances, assign every instance to a floor (explicit, else
-    // round-robin), then lay each floor out as a room row above a full-width hallway hub.
+    // round-robin), then pack each floor as two room rows flanking a central full-width corridor
+    // (a "double-loaded corridor"): every room reaches the corridor for a door, and adjacency
+    // ordering keeps required neighbours in adjacent slices so they share a wall too.
     private static List<RoomSpec> LayOut(FloorPlanBrief brief, int floorCount)
     {
         static string HallwayOn(int floor) => $"Hallway (Floor {floor})";
@@ -148,39 +150,159 @@ public sealed class RagService : IRagService
             }
         }
 
-        // 2. Lay out each floor and materialise enriched RoomSpecs with concrete footprints.
+        // 2. Pack each floor and materialise enriched RoomSpecs with concrete footprints.
         var rooms = new List<RoomSpec>();
         for (var floor = 0; floor < floorCount; floor++)
         {
             var onFloor = byFloor[floor];
             if (onFloor.Count == 0) continue;
 
-            var cursorX = 0.0; // running x-offset of the room row
-            foreach (var inst in onFloor)
+            var (plotW, plotD) = ResolvePlot(brief, onFloor);
+            var hc = HallwayDepthM;
+            var sideDepth = (plotD - hc) / 2;              // depth of each room band
+            var topY = (plotD + hc) / 2;                   // bottom edge of the top band
+            var corridorY = (plotD - hc) / 2;              // bottom edge of the corridor
+
+            var ordered = OrderByAdjacency(onFloor, neighbours, brief.Circulation);
+            var (top, bottom) = SplitRows(ordered, sideDepth);
+
+            void AddRoom(Instance inst, RoomFootprint fp)
             {
-                var width = inst.Area / RoomDepthM;
-                var footprint = new RoomFootprint(cursorX, HallwayDepthM, width, RoomDepthM);
                 var p = inst.Program;
                 rooms.Add(new RoomSpec(
-                    inst.Name, inst.Area, floor, inst.Adjacent, footprint,
+                    inst.Name, inst.Area, floor, inst.Adjacent, fp,
                     Type: p.Type,
                     PrivacyLevel: p.PrivacyLevel,
                     RequiresNaturalLight: p.RequiresNaturalLight,
                     RequiresEnsuite: p.RequiresEnsuite,
                     IsPrimary: p.IsPrimary,
                     TargetAreaSqm: p.TargetAreaSqm));
-                cursorX += width;
+            }
+
+            var xTop = 0.0;
+            foreach (var inst in top)
+            {
+                var w = inst.Area / sideDepth;
+                AddRoom(inst, new RoomFootprint(xTop, topY, w, sideDepth));
+                xTop += w;
+            }
+
+            var xBot = 0.0;
+            foreach (var inst in bottom)
+            {
+                var w = inst.Area / sideDepth;
+                AddRoom(inst, new RoomFootprint(xBot, 0, w, sideDepth));
+                xBot += w;
             }
 
             if (wantHallway)
             {
-                var hallFootprint = new RoomFootprint(0, 0, cursorX, HallwayDepthM);
-                rooms.Add(new RoomSpec(HallwayOn(floor), cursorX * HallwayDepthM, floor,
-                    [], hallFootprint, Type: RoomType.Hallway));
+                // Corridor spans the full plot / widest occupied row so every room reaches it.
+                var corridorW = Math.Max(plotW, Math.Max(xTop, xBot));
+                rooms.Add(new RoomSpec(HallwayOn(floor), corridorW * hc, floor,
+                    [], new RoomFootprint(0, corridorY, corridorW, hc), Type: RoomType.Hallway));
             }
         }
 
         return rooms;
+    }
+
+    // --- Plot + packing helpers --------------------------------------------------------------
+
+    // Resolve the plot rectangle (metres) for one floor's rooms. Honour an explicit plot when both
+    // dimensions are given (widening it if the program can't fit two rows into the stated width);
+    // otherwise derive a square-ish plot sized so the median room comes out roughly square.
+    private static (double Width, double Depth) ResolvePlot(FloorPlanBrief brief, List<Instance> onFloor)
+    {
+        var totalArea = onFloor.Sum(i => i.Area);
+        var median = MedianArea(onFloor);
+        // Working band depth so a median-area room is ~square (side ≈ sqrt(area)).
+        var sideDepth = Math.Clamp(Math.Sqrt(median), 3.0, 6.0);
+
+        var plot = brief.Constraints?.PlotDimensions;
+        if (plot?.WidthM is > 0 && plot.DepthM is > 0)
+        {
+            var depth = plot.DepthM.Value;
+            var band = (depth - HallwayDepthM) / 2;
+            if (band < 1.0) // too shallow for two rows + corridor → grow depth to fit
+            {
+                band = sideDepth;
+                depth = 2 * band + HallwayDepthM;
+            }
+            // Widen if the stated width can't hold two rows of the program area.
+            var needed = totalArea / (2 * band);
+            return (Math.Max(plot.WidthM.Value, needed), depth);
+        }
+
+        var width = totalArea / (2 * sideDepth);
+        return (Math.Max(width, sideDepth), 2 * sideDepth + HallwayDepthM);
+    }
+
+    private static double MedianArea(List<Instance> onFloor)
+    {
+        var areas = onFloor.Select(i => i.Area).OrderBy(a => a).ToList();
+        return areas.Count == 0 ? 0 : areas[areas.Count / 2];
+    }
+
+    // Order rooms so required neighbours sit next to each other (→ shared wall → door), biased so
+    // public-zone rooms come first and private-zone rooms last. Greedy walk of the neighbour graph:
+    // seed with the lowest-zone unplaced room, then keep appending an unplaced neighbour of the last
+    // room until the run ends, then reseed.
+    private static List<Instance> OrderByAdjacency(
+        List<Instance> onFloor,
+        Dictionary<string, HashSet<string>> neighbours,
+        CirculationSpec? circ)
+    {
+        var publicRooms = new HashSet<string>(circ?.PublicZoneRooms ?? [], StringComparer.OrdinalIgnoreCase);
+        var privateRooms = new HashSet<string>(circ?.PrivateZoneRooms ?? [], StringComparer.OrdinalIgnoreCase);
+        int Zone(Instance i) => publicRooms.Contains(i.Program.Id) ? 0 : privateRooms.Contains(i.Program.Id) ? 2 : 1;
+
+        bool Linked(Instance a, Instance b) =>
+            neighbours.TryGetValue(a.Program.Id, out var set) && set.Contains(b.Program.Id);
+
+        var remaining = onFloor.OrderBy(Zone).ThenBy(i => i.Name, StringComparer.Ordinal).ToList();
+        var ordered = new List<Instance>(remaining.Count);
+
+        while (remaining.Count > 0)
+        {
+            var current = remaining[0]; // lowest-zone unplaced room
+            remaining.RemoveAt(0);
+            ordered.Add(current);
+
+            // Extend the run through linked, unplaced neighbours (lowest zone first).
+            while (true)
+            {
+                var next = remaining
+                    .Where(r => Linked(current, r))
+                    .OrderBy(Zone).ThenBy(r => r.Name, StringComparer.Ordinal)
+                    .FirstOrDefault();
+                if (next is null) break;
+                remaining.Remove(next);
+                ordered.Add(next);
+                current = next;
+            }
+        }
+
+        return ordered;
+    }
+
+    // Split the ordered rooms into a top and bottom band, adding each room to whichever side is
+    // currently narrower so the two rows stay balanced around the corridor.
+    private static (List<Instance> Top, List<Instance> Bottom) SplitRows(
+        List<Instance> ordered, double sideDepth)
+    {
+        var top = new List<Instance>();
+        var bottom = new List<Instance>();
+        double wTop = 0, wBot = 0;
+
+        foreach (var inst in ordered)
+        {
+            var w = inst.Area / sideDepth;
+            if (wTop <= wBot) { top.Add(inst); wTop += w; }
+            else { bottom.Add(inst); wBot += w; }
+        }
+
+        return (top, bottom);
     }
 
     // Fold RoomProgram.AdjacentTo and AdjacencySpec.Required into one symmetric Id→neighbours map.
