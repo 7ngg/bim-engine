@@ -17,6 +17,11 @@ namespace BimEngine.RevitAddin;
 /// </summary>
 public sealed class RevitGeometryBuilder
 {
+    // Stable tag written to the Comments parameter of every element we create, so a later build can
+    // find and delete the previous one (clean replace). Deliberately constant — NOT the per-send
+    // ProjectId, which is regenerated on every Enrich call and would make prior output un-findable.
+    private const string Marker = "BimEngine";
+
     private static double ToFeet(double metres) =>
         UnitUtils.ConvertToInternalUnits(metres, UnitTypeId.Meters);
 
@@ -24,6 +29,10 @@ public sealed class RevitGeometryBuilder
     {
         var wallType = FirstBasicWallType(doc);
         var heightFt = ToFeet(command.FloorHeightM);
+
+        // 0. Clean replace: remove BimEngine geometry from a previous build so re-sending a brief
+        //    replaces the model instead of stacking an identical copy on top of it.
+        ClearPrevious(doc);
 
         // 1. One Level per floor.
         var levels = new Dictionary<int, Level>();
@@ -34,8 +43,10 @@ public sealed class RevitGeometryBuilder
             levels[floor] = level;
         }
 
-        // 2. Walls per room footprint. Track walls per floor so doors can find a host.
+        // 2. Walls per room footprint. Track walls per floor so doors can find a host. A shared set
+        //    of edge keys skips coincident walls where adjacent rooms (and the hallway spine) meet.
         var wallsByFloor = new Dictionary<int, List<Wall>>();
+        var builtEdges = new HashSet<string>();
         foreach (var room in command.Rooms)
         {
             if (room.Footprint is null || !levels.TryGetValue(room.FloorIndex, out var level))
@@ -45,7 +56,7 @@ public sealed class RevitGeometryBuilder
                 ? existing
                 : wallsByFloor[room.FloorIndex] = new List<Wall>();
 
-            walls.AddRange(BuildRoomWalls(doc, room.Footprint, wallType, level, heightFt));
+            walls.AddRange(BuildRoomWalls(doc, room.Footprint, wallType, level, heightFt, builtEdges));
         }
 
         // Rooms and doors both need the newly created walls to be part of the model graph.
@@ -61,7 +72,13 @@ public sealed class RevitGeometryBuilder
             var centre = new UV(ToFeet(fp.OriginXm + fp.WidthM / 2), ToFeet(fp.OriginYm + fp.DepthM / 2));
             var placed = doc.Create.NewRoom(level, centre);
             if (placed is not null)
+            {
                 TrySetName(() => placed.Name = room.Name);
+                // Bound the room to its own floor so stacked levels don't overlap volumes.
+                placed.UpperLimit = level;
+                placed.LimitOffset = heightFt;
+                Tag(placed);
+            }
         }
 
         // 4. A door on each shared wall.
@@ -83,14 +100,17 @@ public sealed class RevitGeometryBuilder
                     var host = NearestWall(walls, point);
                     if (host is null) continue;
 
-                    doc.Create.NewFamilyInstance(point, doorSymbol, host, level, StructuralType.NonStructural);
+                    var instance = doc.Create.NewFamilyInstance(
+                        point, doorSymbol, host, level, StructuralType.NonStructural);
+                    Tag(instance);
                 }
             }
         }
     }
 
     private static IEnumerable<Wall> BuildRoomWalls(
-        Document doc, RoomFootprint fp, WallType wallType, Level level, double heightFt)
+        Document doc, RoomFootprint fp, WallType wallType, Level level, double heightFt,
+        HashSet<string> builtEdges)
     {
         var z = level.Elevation;
         var x0 = ToFeet(fp.OriginXm);
@@ -105,10 +125,26 @@ public sealed class RevitGeometryBuilder
 
         foreach (var (a, b) in new[] { (c0, c1), (c1, c2), (c2, c3), (c3, c0) })
         {
+            // Adjacent rooms share edges; skip an edge already walled this run so we don't create
+            // two coincident walls (which Revit flags as "Highlighted walls overlap").
+            if (!builtEdges.Add(EdgeKey(a, b, level.Id))) continue;
+
             var wall = Wall.Create(doc, Line.CreateBound(a, b), wallType.Id, level.Id,
                 heightFt, offset: 0, flip: false, structural: false);
+            Tag(wall);
             yield return wall;
         }
+    }
+
+    // Order-independent key for a wall edge: endpoints rounded to a tolerance, smaller first, plus
+    // the hosting level so edges at the same XY on different floors stay distinct.
+    private static string EdgeKey(XYZ a, XYZ b, ElementId level)
+    {
+        static (long, long, long) Q(XYZ p) =>
+            ((long)Math.Round(p.X * 1e4), (long)Math.Round(p.Y * 1e4), (long)Math.Round(p.Z * 1e4));
+        var (qa, qb) = (Q(a), Q(b));
+        var (lo, hi) = qa.CompareTo(qb) <= 0 ? (qa, qb) : (qb, qa);
+        return $"{level.Value}:{lo.Item1},{lo.Item2},{lo.Item3}-{hi.Item1},{hi.Item2},{hi.Item3}";
     }
 
     private static Wall? NearestWall(List<Wall> walls, XYZ point)
@@ -142,6 +178,31 @@ public sealed class RevitGeometryBuilder
             .OfCategory(BuiltInCategory.OST_Doors)
             .Cast<FamilySymbol>()
             .FirstOrDefault();
+
+    // Stamp an element as BimEngine-created (Comments param) so ClearPrevious can find it later.
+    private static void Tag(Element element) =>
+        element.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)?.Set(Marker);
+
+    // Delete geometry from a previous BimEngine build. Deleting a Level cascades to its hosted
+    // walls/rooms/doors; the Comments tag catches anything not tied to a BimEngine level. Only
+    // BimEngine-tagged/named elements match, so pre-existing model content is left untouched.
+    private static void ClearPrevious(Document doc)
+    {
+        var stale = new FilteredElementCollector(doc)
+            .WhereElementIsNotElementType()
+            .Where(e => e.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)?.AsString() == Marker)
+            .Select(e => e.Id)
+            .ToList();
+
+        stale.AddRange(new FilteredElementCollector(doc)
+            .OfClass(typeof(Level))
+            .Cast<Level>()
+            .Where(l => l.Name.StartsWith("BimEngine ", StringComparison.Ordinal))
+            .Select(l => l.Id));
+
+        if (stale.Count > 0) doc.Delete(stale);
+        doc.Regenerate();
+    }
 
     // Names can clash with existing elements; a duplicate name is non-fatal for a PoC.
     private static void TrySetName(Action set)
