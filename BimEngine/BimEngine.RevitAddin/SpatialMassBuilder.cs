@@ -5,8 +5,9 @@ namespace BimEngine.RevitAddin;
 
 /// <summary>
 /// Translates a <see cref="SpatialLayoutResult"/> (the PLAN pipeline) into real Revit geometry: one
-/// <see cref="DirectShape"/> mass (category <c>OST_Mass</c>) per spatial unit, extruded from its 3D
-/// bounding box. This is the faithful Revit realisation of the article's Stage 3 ("3D kütlə").
+/// <see cref="DirectShape"/> box (category <c>OST_GenericModel</c>) per spatial unit, extruded from
+/// its 3D bounding box. This is the Revit realisation of the article's Stage 3 ("3D kütlə") — Generic
+/// Model rather than Mass so the result is visible without toggling "Show Mass".
 ///
 /// Independent of <see cref="RevitGeometryBuilder"/>: it consumes the spatial model directly, so no
 /// bbox→footprint conversion ever happens. Runs on Revit's main API thread inside an already-open
@@ -28,13 +29,16 @@ public sealed class SpatialMassBuilder
         // the model instead of stacking a copy on top.
         ClearPrevious(doc);
 
-        var massCategory = new ElementId(BuiltInCategory.OST_Mass);
+        // Generic Model (NOT OST_Mass): masses live under the Mass category, which Revit hides unless
+        // "Show Mass" is toggled on — so a correct build looks like nothing happened. Generic Model is
+        // visible in every view by default, which is what a PoC wants.
+        var shapeCategory = new ElementId(BuiltInCategory.OST_GenericModel);
         foreach (var unit in result.Units)
         {
             var solid = TryCreateBox(unit.Bbox);
             if (solid is null) continue;
 
-            var directShape = DirectShape.CreateElement(doc, massCategory);
+            var directShape = DirectShape.CreateElement(doc, shapeCategory);
             directShape.SetShape(new List<GeometryObject> { solid });
             TrySetName(() => directShape.Name = unit.Name);
             Tag(directShape);
