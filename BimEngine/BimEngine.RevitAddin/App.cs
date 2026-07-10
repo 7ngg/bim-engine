@@ -24,6 +24,9 @@ public sealed class App : IExternalApplication
     private CancellationTokenSource? _cts;
     private Task? _consumerLoop;
 
+    // Second, INDEPENDENT consumer: the PLAN's spatial-layout masses (own drop subfolder, own event).
+    private SpatialLayoutWatcher? _spatialWatcher;
+
     // Must match the API's DropFolder. Override via the BIMENGINE_DROP env var on either process.
     private static string DropFolder =>
         Environment.GetEnvironmentVariable("BIMENGINE_DROP")
@@ -50,6 +53,14 @@ public sealed class App : IExternalApplication
             catch (OperationCanceledException) { /* shutting down */ }
         });
 
+        // Spatial-layout pipeline: its own event handler + folder watcher. The watcher runs on a
+        // background thread and only enqueues + raises; SpatialMassEventHandler builds on the main
+        // API thread. Fully separate from the GeometryCommand path above.
+        var spatialHandler = new SpatialMassEventHandler();
+        var spatialEvent = ExternalEvent.Create(spatialHandler);
+        _spatialWatcher = new SpatialLayoutWatcher(DropFolder, spatialHandler, spatialEvent);
+        _spatialWatcher.Start();
+
         // A ribbon button so the user can see the add-in is live and where it's watching.
         var panel = application.CreateRibbonPanel("BimEngine");
         var buttonData = new PushButtonData(
@@ -68,6 +79,7 @@ public sealed class App : IExternalApplication
         _cts?.Cancel();
         try { _consumerLoop?.Wait(TimeSpan.FromSeconds(2)); } catch { /* ignore */ }
         _cts?.Dispose();
+        _spatialWatcher?.Dispose();
         return Result.Succeeded;
     }
 }

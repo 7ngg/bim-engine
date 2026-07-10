@@ -15,6 +15,7 @@
     <ProjectReference Include="..\BimEngine.Core\BimEngine.Core.csproj" />
     <ProjectReference Include="..\BimEngine.Infrastructure\BimEngine.Infrastructure.csproj" />
     <ProjectReference Include="..\BimEngine.MockConsumer\BimEngine.MockConsumer.csproj" />
+    <ProjectReference Include="..\BimEngine.SpatialLayout\BimEngine.SpatialLayout.csproj" />
   </ItemGroup>
 
 </Project>

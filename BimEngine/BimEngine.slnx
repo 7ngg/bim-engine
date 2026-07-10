@@ -3,4 +3,5 @@
   <Project Path="BimEngine.Core/BimEngine.Core.csproj" />
   <Project Path="BimEngine.Infrastructure/BimEngine.Infrastructure.csproj" />
   <Project Path="BimEngine.MockConsumer/BimEngine.MockConsumer.csproj" />
+  <Project Path="BimEngine.SpatialLayout/BimEngine.SpatialLayout.csproj" />
 </Solution>

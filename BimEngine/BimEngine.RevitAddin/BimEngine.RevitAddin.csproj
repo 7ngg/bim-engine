@@ -37,6 +37,7 @@
   <ItemGroup>
     <ProjectReference Include="..\BimEngine.Core\BimEngine.Core.csproj" />
     <ProjectReference Include="..\BimEngine.Infrastructure\BimEngine.Infrastructure.csproj" />
+    <ProjectReference Include="..\BimEngine.SpatialLayout\BimEngine.SpatialLayout.csproj" />
   </ItemGroup>
 
   <!-- Copy the add-in + its own (non-Revit) dependencies into the Revit Addins folder. -->
@@ -46,7 +47,7 @@
     </PropertyGroup>
     <MakeDir Directories="$(AddinsDir)" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\BimEngine.RevitAddin.addin" DestinationFolder="$(AddinsDir)" />
-    <Copy SourceFiles="$(TargetDir)BimEngine.RevitAddin.dll;$(TargetDir)BimEngine.Core.dll;$(TargetDir)BimEngine.Infrastructure.dll"
+    <Copy SourceFiles="$(TargetDir)BimEngine.RevitAddin.dll;$(TargetDir)BimEngine.Core.dll;$(TargetDir)BimEngine.Infrastructure.dll;$(TargetDir)BimEngine.SpatialLayout.dll"
           DestinationFolder="$(AddinsDir)" />
   </Target>
 

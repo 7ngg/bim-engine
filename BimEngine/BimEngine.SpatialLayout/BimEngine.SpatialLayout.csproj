@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Self-contained relation-matrix spatial-layout engine (the PLAN pipeline).
+
+    Deliberately dependency-free (in-box BCL only): a pure, portable port of the article's
+    SpatialUnit + LayoutGenerator, generalized to any number of units. It shares NOTHING with the
+    FloorPlanBrief -> GeometryCommand pipeline; its own request/result types travel end-to-end so
+    the PLAN model is never converted or lossily mapped onto RoomSpec.
+
+    Referenced by BimEngine.Api (the HTTP endpoint) and BimEngine.RevitAddin (the mass consumer).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

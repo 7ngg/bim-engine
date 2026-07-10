@@ -2,6 +2,7 @@ using BimEngine.Api.Services;
 using BimEngine.Core.Contracts;
 using BimEngine.Infrastructure;
 using BimEngine.MockConsumer;
+using BimEngine.SpatialLayout;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -9,6 +10,10 @@ var builder = WebApplication.CreateBuilder(args);
 // RAG-style validation/enrichment: user-authored FloorPlanBrief -> GeometryCommand. Stateless ->
 // singleton is fine.
 builder.Services.AddSingleton<IRagService, RagService>();
+
+// Second, INDEPENDENT pipeline (the PLAN): relation-matrix SpatialLayoutRequest -> 3D masses. Its
+// own engine + sink; shares nothing with the RAG/GeometryCommand path above. Stateless -> singleton.
+builder.Services.AddSingleton<SpatialLayoutEngine>();
 
 // Transport is switchable (DI-only — the IMessageQueue seam never leaks to callers):
 //   "InMemory" (default): single-process demo. Channel<T> queue + in-process MockRevitConsumer.
@@ -25,6 +30,10 @@ if (string.Equals(transport, "FileDrop", StringComparison.OrdinalIgnoreCase))
         : configuredDrop;
     // Singleton so the whole app shares one instance over the shared folder.
     builder.Services.AddSingleton<IMessageQueue>(_ => new FileDropMessageQueue(dropDir));
+
+    // Spatial pipeline uses the same drop root (its own `spatial/` subfolder) so the Revit mass
+    // consumer picks results up cross-process.
+    builder.Services.AddSingleton<ISpatialLayoutSink>(_ => new FileDropSpatialSink(dropDir));
 }
 else
 {
@@ -35,6 +44,9 @@ else
     // IMessageQueue singleton. The real Revit add-in replaces this out-of-process (FileDrop).
     builder.Services.AddSingleton<MockRevitConsumer>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<MockRevitConsumer>());
+
+    // Spatial pipeline's zero-setup consumer: log the masses it would build.
+    builder.Services.AddSingleton<ISpatialLayoutSink, LoggingSpatialSink>();
 }
 
 builder.Services.AddControllers();
